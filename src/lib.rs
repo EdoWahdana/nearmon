@@ -5,7 +5,7 @@ use near_sdk::json_types::{ValidAccountId, U128};
 use near_sdk::serde::{Deserialize, Serialize};
 use near_sdk::{
   env, near_bindgen, ext_contract, AccountId, PanicOnDefault, 
-  BorshStorageKey, Balance, Promise,
+  BorshStorageKey, Promise
 };
 
 use near_contract_standards::non_fungible_token::{Token, TokenId, NonFungibleToken};
@@ -13,8 +13,11 @@ use near_contract_standards::non_fungible_token::metadata::{
   NFTContractMetadata, NonFungibleTokenMetadataProvider, TokenMetadata, NFT_METADATA_SPEC,
 };
 
+mod metadatas;
+
 near_sdk::setup_alloc!();
 
+const MINIMUM_EARLY_DEPOSIT: u128 = 10u128.pow(24);
 pub type MetadataType = String;
 
 #[derive(Serialize, Deserialize)]
@@ -31,6 +34,8 @@ pub struct Contract {
   owner_id: AccountId,
   tokens: NonFungibleToken,
   metadata_per_type: UnorderedMap<MetadataType, UnorderedSet<TokenMetadata>>,
+  egg_per_token_id: UnorderedMap<TokenId, u64>,
+  level_per_token_id: UnorderedMap<TokenId, u64>,
   metadata: LazyOption<NFTContractMetadata>,
   current_token_id: TokenId,
 }
@@ -45,6 +50,8 @@ enum StorageKey {
   MetadataPerType,
   Metadata,
   MetadataPerTypeInner,
+  EggPerTokenId,
+  LevelPerTokenId,
 }
 
 pub trait NonFungibleTokenCore {
@@ -70,8 +77,8 @@ impl Contract {
       owner_id,
       NFTContractMetadata {
         spec: NFT_METADATA_SPEC.to_string(),
-        name: "Near Features".to_string(),
-        symbol: "NFEAT".to_string(),
+        name: "Nearmon".to_string(),
+        symbol: "NMON".to_string(),
         icon: None,
         base_uri: None,
         reference: None,
@@ -97,6 +104,8 @@ impl Contract {
         Some(StorageKey::Enumeration),
         Some(StorageKey::Approval),
       ),
+      egg_per_token_id: UnorderedMap::new(StorageKey::EggPerTokenId),
+      level_per_token_id: UnorderedMap::new(StorageKey::LevelPerTokenId),
       metadata_per_type: UnorderedMap::new(StorageKey::MetadataPerType),
       metadata: LazyOption::new(
         StorageKey::Metadata.try_to_vec().unwrap(),
@@ -133,23 +142,23 @@ impl Contract {
   #[payable]
   pub fn nft_mint_egg(
     &mut self,
-    metadata_set: u64,
     receiver_id: AccountId,
   ) {
     self.increment_token_id();
 
-    let initial_storage_usage = env::storage_usage();
-    let metadata_type = String::from("egg");
+    let metadata_type = 0u64;
     let owner_id: AccountId = receiver_id;
+    let mut metadata_set = self.get_random_number() as u64;
+    metadata_set = metadata_set % 16 + 1;
 
-    // let metadata_type_set = self.metadata_per_type.get(&metadata_type).unwrap();
-    // let mut metadata = metadata_type_set.as_vector().get(metadata_set).unwrap();
-    // metadata.issued_at = Some(env::block_timestamp().to_string());
-    // metadata.copies = Some(1u64);
     let metadata: TokenMetadata = self.get_metadata_per_type(metadata_type, metadata_set);
 
     self.tokens.owner_by_id.insert(&self.current_token_id, &owner_id);
 
+    self.egg_per_token_id.insert(&self.current_token_id, &metadata_set);
+
+    self.level_per_token_id.insert(&self.current_token_id, &0u64);
+    
     self.tokens
       .token_metadata_by_id
       .as_mut()
@@ -165,20 +174,25 @@ impl Contract {
       tokens_per_owner.insert(&owner_id, &token_ids);
     }
 
-    let required_storage_in_bytes = env::storage_usage() - initial_storage_usage;
-    refund_deposit(required_storage_in_bytes);
+    refund_deposit();
   }
 
   #[payable]
-  pub fn nft_evolve_1(
+  pub fn nft_evolve(
     &mut self,
     token_id: TokenId,
-    metadata_set: u64,
     receiver_id: AccountId,
-  ) {
-    let initial_storage_usage = env::storage_usage();
-    
+  ) {    
     self.increment_token_id();
+    let evolve_time;
+
+    if let Some(temp_metadata) = &self.tokens.token_metadata_by_id {
+      evolve_time = temp_metadata.get(&token_id).unwrap().extra.unwrap();
+      
+      if env::block_timestamp() / 1000000 < evolve_time.parse::<u64>().unwrap() {
+        panic!("The evolve time is not fullfiled");
+      }
+    }
 
     let owner_id = self.tokens.owner_by_id.get(&token_id).unwrap();
     assert_eq!(
@@ -205,9 +219,15 @@ impl Contract {
       token_metadata_by_id.remove(&token_id);
     }
 
-    let metadata_type = String::from("level1");
+    let metadata_set = self.egg_per_token_id.get(&token_id).unwrap();
+    self.egg_per_token_id.insert(&self.current_token_id, &metadata_set);
 
-    let metadata: TokenMetadata = self.get_metadata_per_type(metadata_type, metadata_set);
+    let mut token_level = self.level_per_token_id.get(&token_id).unwrap();
+    token_level = token_level + 1;
+    self.level_per_token_id.remove(&token_id);
+    self.level_per_token_id.insert(&self.current_token_id, &token_level);    
+
+    let metadata: TokenMetadata = self.get_metadata_per_type(token_level, metadata_set);
     self.tokens.owner_by_id.insert(&self.current_token_id, &owner_id);
 
     self.tokens
@@ -225,8 +245,7 @@ impl Contract {
       tokens_per_owner.insert(&owner_id, &token_ids);
     }
 
-    let required_storage_in_bytes = env::storage_usage() - initial_storage_usage;
-    refund_deposit(required_storage_in_bytes)
+    refund_deposit()
   }
 
   pub fn nft_tokens_for_owner(
@@ -282,6 +301,31 @@ impl Contract {
     self.tokens.owner_id.clone()
   }
 
+  pub fn metadata_type_list(&self) -> Vec<String> {
+    let metadata_vector = self.metadata_per_type.keys_as_vector();
+    metadata_vector.to_vec()
+  }
+
+  pub fn metadata_per_type_list(
+    &self,
+    metadata_type: MetadataType,
+  ) -> Vec<TokenMetadata> {
+    let metadata_vector = if let Some(metadata_set) = self.metadata_per_type.get(&metadata_type) {
+      metadata_set
+    } else {
+      return vec![];
+    };
+
+    metadata_vector.to_vec()
+  }
+
+  pub fn level_per_token(
+    &self, 
+    token_id: TokenId,
+  ) -> u64 {
+    self.level_per_token_id.get(&token_id).unwrap()
+  }
+
   fn increment_token_id(
     &mut self,
   ) {
@@ -292,16 +336,32 @@ impl Contract {
 
   fn get_metadata_per_type(
     &self,
-    metadata_type: String,
+    metadata_type: u64,
     metadata_set: u64,
   ) -> TokenMetadata {
-    let metadata_type_set = self.metadata_per_type.get(&metadata_type).unwrap();
-    let mut metadata = metadata_type_set.as_vector().get(metadata_set).unwrap();
-    metadata.issued_at = Some(env::block_timestamp().to_string());
+    let current = env::block_timestamp() / 1000000;
+    let next = current + 300000;
+
+    let mut metadata = match metadata_type {
+      0 => metadatas::get_metadata_egg(metadata_set),
+      1 => metadatas::get_metadata_monster_1(metadata_set),
+      2 => metadatas::get_metadata_monster_2(metadata_set),
+      3 => metadatas::get_metadata_monster_3(metadata_set),
+      _ => panic!("You have reach the maximum level of your monster"),
+    };
+
+    metadata.issued_at = Some(current.to_string());
     metadata.copies = Some(1u64);
+    metadata.extra = Some(next.to_string());
 
     metadata
   }
+
+  fn get_random_number(&self) -> u8 {
+    let rand: u8 = *env::random_seed().get(0).unwrap();
+    rand
+  }
+
 }
 
 #[near_bindgen]
@@ -311,15 +371,15 @@ impl NonFungibleTokenMetadataProvider for Contract {
     }
 }
 
-fn refund_deposit(storage_used: u64) {
-  let required_cost = env::storage_byte_cost() * Balance::from(storage_used);
+fn refund_deposit() {
+  // let required_cost = env::storage_byte_cost() * Balance::from(storage_used);
+  let required_cost = MINIMUM_EARLY_DEPOSIT;
 
   let attached_deposit = env::attached_deposit();
 
   assert!(
     required_cost <= attached_deposit,
-    "Must attach {} yoctoNEAR to cover storage",
-    required_cost,
+    "Must attach 1 NEAR to cover storage",
   );
 
   let refund = attached_deposit - required_cost;
@@ -336,7 +396,6 @@ mod tests {
     use near_sdk::MockedBlockchain;
     use near_sdk::{testing_env};
 
-    const STORAGE_FOR_MINT: Balance = 11280000000000000000000;
     const DATA_IMAGE_SVG_PARAS_ICON: &str = "data:image/svg+xml,%3Csvg width='1080' height='1080' viewBox='0 0 1080 1080' fill='none' xmlns='http://www.w3.org/2000/svg'%3E%3Crect width='1080' height='1080' rx='10' fill='%230000BA'/%3E%3Cpath fill-rule='evenodd' clip-rule='evenodd' d='M335.238 896.881L240 184L642.381 255.288C659.486 259.781 675.323 263.392 689.906 266.718C744.744 279.224 781.843 287.684 801.905 323.725C827.302 369.032 840 424.795 840 491.014C840 557.55 827.302 613.471 801.905 658.779C776.508 704.087 723.333 726.74 642.381 726.74H468.095L501.429 896.881H335.238ZM387.619 331.329L604.777 369.407C614.008 371.807 622.555 373.736 630.426 375.513C660.02 382.193 680.042 386.712 690.869 405.963C704.575 430.164 711.428 459.95 711.428 495.321C711.428 530.861 704.575 560.731 690.869 584.932C677.163 609.133 648.466 621.234 604.777 621.234H505.578L445.798 616.481L387.619 331.329Z' fill='white'/%3E%3C/svg%3E";
 
     fn get_context(predecessor_account_id: ValidAccountId) -> VMContextBuilder {
@@ -393,36 +452,4 @@ mod tests {
         assert_eq!(contract.nft_metadata().base_uri.unwrap(), "https://ipfs.fleek.co/ipfs/".to_string());
         assert_eq!(contract.nft_metadata().icon.unwrap(), DATA_IMAGE_SVG_PARAS_ICON.to_string());
     }
-
-    #[test]
-    fn test_add_metadata() {
-      let (mut context, mut contract) = setup_contract();
-      testing_env!(context
-        .predecessor_account_id(accounts(1))
-        .build()
-      );
-
-      let metadata_type = String::from("egg");
-      let mut metadata_set = UnorderedSet::new(StorageKey::MetadataPerTypeInner);
-      metadata_set.insert(&sample_token_metadata());
-
-      contract.metadata_per_type.insert(&metadata_type, &metadata_set);
-
-      assert_eq!(
-        contract.get_metadata_length(metadata_type),
-        1,
-      );
-    }
-
-    #[test]
-    fn test_random() {
-      let (mut context, mut contract) = setup_contract();
-
-      let random = contract.get_rand();
-      assert_eq!(
-        random,
-        12299
-      );
-    }
-
 }
